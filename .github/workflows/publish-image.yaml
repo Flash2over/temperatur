@@ -12,5 +12,5 @@ jobs:
       - name: Build and Push the Docker image
         run: |
           docker login --username flash2over --password ${{ secrets.DOCKER_PASSWORD }} ghcr.io
-          docker build . -t ghcr.io/flash2over/raid-craft:latest
-          docker push ghcr.io/flash2over/raid-craft:latest
+          docker build . -t ghcr.io/flash2over/temperatur:latest
+          docker push ghcr.io/flash2over/temperatur:latest
