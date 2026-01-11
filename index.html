@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Temp Dashboard</title>
+  <style>
+    body{font-family:system-ui;margin:16px;background:#0b0f14;color:#e6edf3}
+    .card{background:#121826;border:1px solid #1f2a3a;border-radius:14px;padding:14px}
+    canvas{width:100%!important;height:460px!important}
+    select,input,button{padding:10px;border-radius:10px;border:1px solid #263248;background:#0e1522;color:#e6edf3}
+    button{cursor:pointer}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
+    .pill{padding:8px 10px;border-radius:999px;border:1px solid #263248;background:#0e1522;font-size:13px}
+    .status-ok{border-color:#22543d;background:#0f1a14}
+    .status-alarm{border-color:#7f1d1d;background:#1a0f10}
+    .small{font-size:12px;opacity:.85}
+    .spacer{flex:1}
+    a{color:#9ddcff;text-decoration:none}
+    #customTooltip{
+      position:absolute;
+      background:#ffffff;
+      color:#000000;
+      border:2px solid #333;
+      border-radius:6px;
+      padding:8px 12px;
+      font-family:Arial,sans-serif;
+      font-size:14px;
+      font-weight:bold;
+      pointer-events:none;
+      z-index:1000;
+      display:none;
+      box-shadow:0 4px 8px rgba(0,0,0,0.3);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row">
+      <h2 style="margin:0">Temperatur (Außen / Innen / Heizung)</h2>
+      <div class="spacer"></div>
+      <span class="pill small">Device: <b id="dev"></b></span>
+    </div>
+
+    <div class="row">
+      <span id="status" class="pill status-ok">lade…</span>
+
+      <label class="pill">
+        Zeitraum:
+        <select id="hours">
+          <option value="1" selected>1h</option>
+          <option value="3">3h</option>
+          <option value="6">6h</option>
+          <option value="12">12h</option>
+          <option value="24">24h</option>
+          <option value="48">48h</option>
+          <option value="168">7 Tage</option>
+        </select>
+      </label>
+
+      <button id="btnNow">Jetzt</button>
+      <button id="btnReset">Reset Zoom</button>
+    </div>
+
+    <div class="row">
+      <span class="pill">
+        Von:
+        <input id="from" type="datetime-local">
+      </span>
+      <span class="pill">
+        Bis:
+        <input id="to" type="datetime-local">
+      </span>
+      <button id="btnApplyRange">Range anwenden</button>
+      <button id="btnClearRange">Range löschen</button>
+    </div>
+
+
+    <canvas id="c"></canvas>
+    <div id="customTooltip"></div>
+
+    <div class="row">
+      <span class="pill" id="statsR">Rot: —</span>
+      <span class="pill" id="statsY">Gelb: —</span>
+      <span class="pill" id="statsG">Grün: —</span>
+      <span class="pill small">Stats beziehen sich auf den sichtbaren Bereich (nach Zoom/Range)</span>
+    </div>
+
+    <div class="row small">
+      <span class="pill">Tipp: Mausrad = Zoom, Ziehen = Pan (Shift optional je nach Browser)</span>
+      <span class="pill"><a href="api/query.php?device=ESP13&hours=12" target="_blank">Query-Test</a></span>
+    </div>
+  </div>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- Zoom/Pan Plugin (Chart.js >=3) -->
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
+
+  <script>
+    const DEVICE = "ESP13";
+    document.getElementById('dev').textContent = DEVICE;
+
+    const elHours = document.getElementById('hours');
+    const elStatus = document.getElementById('status');
+    const elFrom = document.getElementById('from');
+    const elTo = document.getElementById('to');
+
+    const elStatsR = document.getElementById('statsR');
+    const elStatsY = document.getElementById('statsY');
+    const elStatsG = document.getElementById('statsG');
+
+// ===== Initial-Setup (Default: letzte 1 Stunde, kein Range-Filter) =====
+elHours.value = "1";
+elFrom.value = "";
+elTo.value   = "";
+
+function setStatus(text, alarm=false){
+      elStatus.textContent = text;
+      elStatus.classList.toggle('status-alarm', alarm);
+      elStatus.classList.toggle('status-ok', !alarm);
+    }
+
+    function fmtTimeSec(sec){
+      const d = new Date(sec * 1000);
+      return d.toLocaleString('de-DE', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    }
+
+    function toLocalInputValue(date){
+      // datetime-local erwartet "YYYY-MM-DDTHH:MM"
+      const pad = (n)=> String(n).padStart(2,'0');
+      const yyyy = date.getFullYear();
+      const mm = pad(date.getMonth()+1);
+      const dd = pad(date.getDate());
+      const hh = pad(date.getHours());
+      const mi = pad(date.getMinutes());
+      return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
+    }
+
+    // Default range inputs: leer lassen, aber sinnvoll vorbelegen
+    elTo.value = '';
+    elFrom.value = '';
+
+    // Registrierung Zoom-Plugin (bei Script-Tag ist es i.d.R. global verfügbar)
+    if (window.ChartZoom) {
+      Chart.register(window.ChartZoom);
+    }
+
+    // Wir speichern die letzte volle Antwort, damit Range/Stats neu berechnet werden kann
+    let raw = { t:[], r:[], y:[], g:[] };
+
+    const ctx = document.getElementById('c');
+
+    // Grenzwerte: Ausreißer markieren (Punkte sichtbar)
+function outOfRange(v){
+  if (v === null || v === undefined) return false;
+  return Number(v) < 0.0;   // <- unter 0°C markieren
+    }
+const zeroLinePlugin = {
+  id: 'zeroLine',
+  afterDraw(chart, args, opts) {
+    const yScale = chart.scales.y;
+    if (!yScale) return;
+
+    const y = yScale.getPixelForValue(0);
+    const ctx = chart.ctx;
+
+    ctx.save();
+    ctx.strokeStyle = '#4da3ff';   // Farbe der 0°C Linie
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);        // gestrichelt
+    ctx.beginPath();
+    ctx.moveTo(chart.chartArea.left, y);
+    ctx.lineTo(chart.chartArea.right, y);
+    ctx.stroke();
+
+    // Label "0 °C"
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#4da3ff';
+    ctx.font = '16px system-ui';
+    ctx.fillText('0 °C', chart.chartArea.left + 6, y - 6);
+
+    ctx.restore();
+  }
+};
+
+    const chart = new Chart(ctx, {
+      plugins: [zeroLinePlugin],
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          {
+            label:'Außentemperatur',
+            data: [],
+            borderColor:'#ff4d4d',
+            pointRadius:(c)=>{
+              const v = c.raw;
+              return outOfRange(v) ? 3 : 0;
+            },
+            pointHoverRadius:4,
+            tension:0.25,
+            borderWidth:2
+          },
+          {
+            label:'Innentemperatur',
+            data: [],
+            borderColor:'#ffd24d',
+            pointRadius:(c)=> outOfRange(c.raw) ? 3 : 0,
+            pointHoverRadius:4,
+            tension:0.25,
+            borderWidth:2
+          },
+          {
+            label:'Heizungstemperatur',
+            data: [],
+            borderColor:'#3dff7a',
+            pointRadius:(c)=> outOfRange(c.raw) ? 3 : 0,
+            pointHoverRadius:4,
+            tension:0.25,
+            borderWidth:2
+          },
+        ]
+      },
+      options: {
+        onHover:(event, elements)=>{
+          const tooltip = document.getElementById('customTooltip');
+          if (elements.length > 0) {
+            const index = elements[0].index;
+            const t = chart.data.labels[index];
+            const r = chart.data.datasets[0].data[index];
+            const y = chart.data.datasets[1].data[index];
+            const g = chart.data.datasets[2].data[index];
+            
+            const date = new Date(Number(t) * 1000);
+            const dateStr = date.toLocaleDateString('de-DE');
+            const timeStr = date.toLocaleTimeString('de-DE');
+            const rVal = r !== null && r !== undefined ? `${Number(r).toFixed(1)}°C` : '—';
+            const yVal = y !== null && y !== undefined ? `${Number(y).toFixed(1)}°C` : '—';
+            const gVal = g !== null && g !== undefined ? `${Number(g).toFixed(1)}°C` : '—';
+            
+            tooltip.innerHTML = `<div style="margin-bottom:4px;font-size:12px;color:#666">${dateStr} ${timeStr}</div><div style="color:#ff4d4d">🔴 Außen: ${rVal}</div><div style="color:#cc9900">🟡 Innen: ${yVal}</div><div style="color:#00aa00">🟢 Heizung: ${gVal}</div>`;
+            tooltip.style.display = 'block';
+            tooltip.style.left = (event.native.pageX + 10) + 'px';
+            tooltip.style.top = (event.native.pageY - 10) + 'px';
+          } else {
+            tooltip.style.display = 'none';
+          }
+        },
+        responsive:true,
+        maintainAspectRatio:false,
+        interaction:{ mode:'index', intersect:false },
+        plugins:{
+          legend:{
+            labels:{
+              font:{ size:16 }
+            }
+          },
+          tooltip:{
+            enabled:false
+          },
+          zoom: {
+            limits: {
+              x: { min: 'original', max: 'original' }
+            },
+            pan: {
+              enabled: true,
+              mode: 'x'
+            },
+            zoom: {
+              wheel: { enabled: true },
+              pinch: { enabled: true },
+              mode: 'x'
+            },
+            onZoomComplete: () => updateStatsVisible(),
+            onPanComplete: () => updateStatsVisible()
+          }
+        },
+        scales:{
+          x:{
+            ticks:{
+              font:{ size:14 },
+              callback:(value, index)=>{
+                // Labels = unix seconds
+                const sec = chart.data.labels[index];
+                if (!sec) return '';
+                const d = new Date(sec * 1000);
+                const h = Number(elHours.value);
+
+                if (h <= 24) {
+                  return d.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+                }
+                return d.toLocaleDateString('de-DE', {day:'2-digit', month:'2-digit'}) + ' ' +
+                       d.toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'});
+              }
+            },
+            grid:{ color:'rgba(170,183,197,.12)' }
+          },
+          y:{
+            title:{display:true,text:'°C',color:'#aab7c5',font:{size:16}},
+            ticks:{ color:'#aab7c5', font:{size:14} },
+            grid:{ color:'rgba(170,183,197,.12)' }
+          }
+        }
+      }
+    });
+
+    function sliceByRange(t, r, y, g, fromSec, toSec){
+      if (!fromSec && !toSec) return {t, r, y, g};
+      const tt=[], rr=[], yy=[], gg=[];
+      for (let i=0;i<t.length;i++){
+        const ts = t[i];
+        if (fromSec && ts < fromSec) continue;
+        if (toSec && ts > toSec) continue;
+        tt.push(ts); rr.push(r[i]); yy.push(y[i]); gg.push(g[i]);
+      }
+      return {t:tt, r:rr, y:yy, g:gg};
+    }
+
+    function applyToChart(data){
+      chart.data.labels = data.t || [];
+      chart.data.datasets[0].data = data.r || [];
+      chart.data.datasets[1].data = data.y || [];
+      chart.data.datasets[2].data = data.g || [];
+      chart.update('none');
+      updateStatusAndAlarms();
+      updateStatsVisible();
+    }
+
+    function updateStatusAndAlarms(){
+      const t = chart.data.labels;
+      const r = chart.data.datasets[0].data;
+      const y = chart.data.datasets[1].data;
+      const g = chart.data.datasets[2].data;
+
+      const n = t.length;
+      if (!n){
+        setStatus(`${DEVICE} | keine Daten`, true);
+        return;
+      }
+
+      const lastT = t[n-1];
+      const lastR = r[n-1];
+      const lastY = y[n-1];
+      const lastG = g[n-1];
+
+      const alarm = outOfRange(lastR) || outOfRange(lastY) || outOfRange(lastG);
+      const msg =
+        `${DEVICE} | Punkte: ${n} | ` +
+        `${fmtTimeSec(lastT)} | ` +
+        `R:${lastR ?? '—'}  Y:${lastY ?? '—'}  G:${lastG ?? '—'}`;
+
+      setStatus(msg, alarm);
+    }
+
+    function statsOfArray(arr){
+      const vals = arr.filter(v => v !== null && v !== undefined && Number.isFinite(Number(v))).map(Number);
+      if (!vals.length) return null;
+      let min = vals[0], max = vals[0], sum = 0;
+      for (const v of vals){
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+      }
+      return { min, max, avg: sum/vals.length };
+    }
+
+    function updateStatsVisible(){
+      const x = chart.scales.x;
+      if (!x) return;
+
+      // sichtbarer Bereich: x.min/x.max sind Label-Werte (Index-basiert je nach Chart.js),
+      // wir nutzen deshalb die Labels und filtern nach Zeitstempel
+      const t = chart.data.labels.map(Number);
+      const r = chart.data.datasets[0].data;
+      const y = chart.data.datasets[1].data;
+      const g = chart.data.datasets[2].data;
+
+      // Fallback: alles
+      let minSec = -Infinity, maxSec = Infinity;
+      if (Number.isFinite(x.min)) minSec = x.min;
+      if (Number.isFinite(x.max)) maxSec = x.max;
+
+      // Bei Category-Scale kann min/max Indizes sein. Wir erkennen das grob:
+      // Wenn min/max kleiner als Label-Werte-Range ist, behandeln wir es als Index.
+      const tMin = t.length ? t[0] : 0;
+      const tMax = t.length ? t[t.length-1] : 0;
+      const looksLikeIndex = (minSec >= 0 && maxSec <= t.length + 5) && (tMax > 1e9);
+
+      let rr=[], yy=[], gg=[];
+      if (looksLikeIndex){
+        const i0 = Math.max(0, Math.floor(minSec));
+        const i1 = Math.min(t.length-1, Math.ceil(maxSec));
+        rr = r.slice(i0, i1+1);
+        yy = y.slice(i0, i1+1);
+        gg = g.slice(i0, i1+1);
+      } else {
+        for (let i=0;i<t.length;i++){
+          if (t[i] < minSec || t[i] > maxSec) continue;
+          rr.push(r[i]); yy.push(y[i]); gg.push(g[i]);
+        }
+      }
+
+      const sr = statsOfArray(rr);
+      const sy = statsOfArray(yy);
+      const sg = statsOfArray(gg);
+
+      elStatsR.textContent = sr ? `Außentemperatur: min ${sr.min.toFixed(2)} | max ${sr.max.toFixed(2)} | Ø ${sr.avg.toFixed(2)}` : 'Außentemperatur: —';
+      elStatsY.textContent = sy ? `Innentemperatur: min ${sy.min.toFixed(2)} | max ${sy.max.toFixed(2)} | Ø ${sy.avg.toFixed(2)}` : 'Innentemperatur: —';
+      elStatsG.textContent = sg ? `Heizungstemperatur: min ${sg.min.toFixed(2)} | max ${sg.max.toFixed(2)} | Ø ${sg.avg.toFixed(2)}` : 'Heizungstemperatur: —';
+    }
+
+async function load(){
+  const h = Number(elHours.value || 1);
+  const url = `api/query.php?device=${encodeURIComponent(DEVICE)}&hours=${h}`;
+
+  setStatus(`Lade ${DEVICE} | ${h}h …`, false);
+
+  const res = await fetch(url, {cache:'no-store'});
+  const j = await res.json();
+
+  raw = { t: j.t || [], r: j.r || [], y: j.y || [], g: j.g || [] };
+
+  // Range nur anwenden, wenn Benutzer wirklich was gesetzt hat
+  const fromV = elFrom.value ? (new Date(elFrom.value)).getTime()/1000 : null;
+  const toV   = elTo.value   ? (new Date(elTo.value)).getTime()/1000 : null;
+
+  const filtered = (fromV || toV)
+    ? sliceByRange(raw.t, raw.r, raw.y, raw.g, fromV, toV)
+    : raw;
+
+  applyToChart(filtered);
+
+  const n = (filtered.t || []).length;
+  if (!n) {
+    setStatus(`${DEVICE} | ${h}h | 0 Punkte (prüf device/hours)`, true);
+  }
+}
+    // UI Events
+    document.getElementById('btnNow').addEventListener('click', ()=>load().catch(e=>setStatus('Fehler: '+e, true)));
+    elHours.addEventListener('change', ()=>load().catch(e=>setStatus('Fehler: '+e, true)));
+
+    document.getElementById('btnReset').addEventListener('click', ()=>{
+      if (chart.resetZoom) chart.resetZoom();
+      updateStatsVisible();
+    });
+
+    document.getElementById('btnApplyRange').addEventListener('click', ()=>{
+      // Bei Range: wir laden nochmal (damit der Filter auf aktuelle Daten geht)
+      load().catch(e=>setStatus('Fehler: '+e, true));
+    });
+
+    document.getElementById('btnClearRange').addEventListener('click', ()=>{
+      elFrom.value = '';
+      elTo.value = '';
+      load().catch(e=>setStatus('Fehler: '+e, true));
+    });
+
+
+    // initial load + auto refresh
+    load().catch(e=>setStatus('Fehler: '+e, true));
+    setInterval(()=>load().catch(()=>{}), 5000);
+  </script>
+</body>
+</html>
