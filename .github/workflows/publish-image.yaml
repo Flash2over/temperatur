@@ -23,4 +23,4 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/flash2over/temperatur:latest
+          tags: ghcr.io/flash2over/raid-craft:latest
